@@ -1,0 +1,213 @@
+---
+layout: post
+title:  "Linux Traffic Control - qdisc"
+date:   2018-08-16 00:51:40 -0700
+categories: networking
+---
+
+
+
+# Linux Traffic Control - qdisc
+
+## Egress Traffic Control
+
+**Linux 流量控制主要是在輸出接口(egress)排列(qdisc)時進行處理和實現**，qdisc入隊出隊的操作在dev_queue_xmit()函數中處理，以Linux kernel v3.3做例子，大致上從下看出其軌跡
+
+- dev_queue_xmit  [dev.c#L2522](https://elixir.bootlin.com/linux/v3.3/source/net/core/dev.c#L2522)
+
+  - if (q->enqueue)    [dev.c#L2543](https://elixir.bootlin.com/linux/v3.3/source/net/core/dev.c#L2543)
+    - __dev_xmit_skb   [dev.c#L2419](https://elixir.bootlin.com/linux/v3.3/source/net/core/dev.c#L2419)
+        - rc = q->enqueue(skb, q) & NET_XMIT_MASK; <span style="color:green">// 封包入隊</span> [dev.c#L2467](https://elixir.bootlin.com/linux/v3.3/source/net/core/dev.c#L2467)
+        - __qdisc_run(q) <span style="color:green">// 出隊控流操作</span> [sch_generic.c#L2473](https://elixir.bootlin.com/linux/v3.3/source/net/core/dev.c#L2473) [sch_generic.c#L190](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L190)
+          - while (qdisc_restart(q)) { [sch_generic.c#L194](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L194)
+            - skb = dequeue_skb(q) <span style="color:green">// 封包出隊</span>  [sch_generic.c#L179](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L179)
+            - sch_direct_xmit <span style="color:green">// 發送<span> [sch_generic.c#L187](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L187)
+              - dev_hard_start_xmit <span style="color:green">// 發送<span> [sch_generic.c#L125](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L125)
+              - dev_requeue_skb <span style="color:green">// 沒有發送成功，則將skb保存到gso_skb中，下一次dequeue再次發送這個skb <span> [sch_generic.c#L143](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L143)
+
+
+
+
+## netdevice qdisc initialization
+
+網卡設備的初始化函數register_netdevice()函數中調用dev_init_scheduler()，並給予qdisc一個初始結構noop_qdisc，此noop_qdisc內都是空操作
+
+- register_netdevice [dev.c#L5537](https://elixir.bootlin.com/linux/v3.3/source/net/core/dev.c#L5537)
+  - dev_init_scheduler [dev.c#L5613(https://elixir.bootlin.com/linux/v3.3/source/net/core/dev.c#L5613)
+    - dev->qdisc = &noop_qdisc [sch_generic.c#L876](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L874)
+
+```c
+struct Qdisc noop_qdisc = {
+	.enqueue	=	noop_enqueue,
+	.dequeue	=	noop_dequeue,
+	.flags		=	TCQ_F_BUILTIN,
+	.ops		=	&noop_qdisc_ops,
+	.list		=	LIST_HEAD_INIT(noop_qdisc.list),
+	.q.lock		=	__SPIN_LOCK_UNLOCKED(noop_qdisc.q.lock),
+	.dev_queue	=	&noop_netdev_queue,
+	.busylock	=	__SPIN_LOCK_UNLOCKED(noop_qdisc.busylock),
+};
+```
+
+在網卡activate(ifconfig up )的時候，才會給予deafult qfifo **pfifo_fast_ops** 或 **mq_qdisc_ops**
+
+- dev_activate [sch_generic.c#L724](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L724)
+  - attach_default_qdiscs(dev) [sch_generic.c#L752](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L752)
+    - if (!netif_is_multiqueue(dev) \|\| dev->tx_queue_len == 0) <span style="color:green">// 如果不是multi queue</span>
+      - pfifo_fast_ops <span style="color:green">// 配置**pfifo_fast_ops** </span>
+    - else <span style="color:green">// 否則，配制multi queue，**mq_qdisc_ops**內可掛多個qdiscs</span>
+      - mq_qdisc_ops
+
+## 數據結構 Qdisc(queueing discipline) 
+
+struct Qdisc [sch_generic.h#L45](https://elixir.bootlin.com/linux/v3.3/source/include/net/sch_generic.h#L45)
+
+```c
+struct Qdisc {
+	int 			(*enqueue)(struct sk_buff *skb, struct Qdisc *dev);  // 入隊操作
+	struct sk_buff *	(*dequeue)(struct Qdisc *dev);                    // 出隊操作
+	unsigned int		flags;
+#define TCQ_F_BUILTIN		1
+#define TCQ_F_INGRESS		2
+#define TCQ_F_CAN_BYPASS	4
+#define TCQ_F_MQROOT		8
+#define TCQ_F_WARN_NONWC	(1 << 16)
+	int			padded;
+    // 基本操作結構
+	const struct Qdisc_ops	*ops;
+	struct qdisc_size_table	__rcu *stab;
+	struct list_head	list;
+	u32			handle;
+	u32			parent;
+	atomic_t		refcnt;
+    // 速率估計
+	struct gnet_stats_rate_est	rate_est;
+	int			(*reshape_fail)(struct sk_buff *skb,
+					struct Qdisc *q);
+
+	void			*u32_node;
+
+	/* This field is deprecated, but it is still used by CBQ
+	 * and it will live until better solution will be invented.
+	 */
+	struct Qdisc		*__parent;
+    // 網路設備net_device列隊
+	struct netdev_queue	*dev_queue;
+	struct Qdisc		*next_sched;
+
+	struct sk_buff		*gso_skb;
+	/*
+	 * For performance sake on SMP, we put highly modified fields at the end
+	 */
+	unsigned long		state;
+	struct sk_buff_head	q;
+    // 統計訊息
+	struct gnet_stats_basic_packed bstats;
+	unsigned int		__state;
+	struct gnet_stats_queue	qstats;
+    // 流控鎖
+	struct rcu_head		rcu_head;
+	spinlock_t		busylock;
+	u32			limit;
+};
+```
+
+
+
+struct Qdisc_ops [sch_generic.h#L150](https://elixir.bootlin.com/linux/v3.3/source/include/net/sch_generic.h#L150)
+
+```c
+struct Qdisc_ops {
+	struct Qdisc_ops	*next;
+	const struct Qdisc_class_ops	*cl_ops;
+    // 網卡名稱
+	char			id[IFNAMSIZ];
+    // 私有數據大小
+	int			priv_size;
+
+    // 入隊操作
+	int 			(*enqueue)(struct sk_buff *, struct Qdisc *);
+    // 出隊操作
+	struct sk_buff *	(*dequeue)(struct Qdisc *);
+    // for work-conserving(工作保留)
+	struct sk_buff *	(*peek)(struct Qdisc *);
+    // 丟棄
+	unsigned int		(*drop)(struct Qdisc *);
+
+	int			(*init)(struct Qdisc *, struct nlattr *arg);
+    // 恢復初始狀態，釋放緩衝，刪除定時器，清空計數器
+	void			(*reset)(struct Qdisc *);
+	void			(*destroy)(struct Qdisc *);
+
+    // 更改Qdisc參數
+	int			(*change)(struct Qdisc *, struct nlattr *arg);
+	void			(*attach)(struct Qdisc *);
+
+	int			(*dump)(struct Qdisc *, struct sk_buff *);
+	int			(*dump_stats)(struct Qdisc *, struct gnet_dump *);
+
+	struct module		*owner;
+};
+```
+
+Qdisc_ops結構體中的函數指針使用過程中調用順序是
+
+ops->init
+
+ops->attach
+
+ops->change
+
+ops->enqueue
+
+ops->dequeue
+
+ops->reset
+
+ops->destroy
+
+以default pfifo_fast_opt	來看  [sch_generic.c#L535](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L535)
+
+```c
+struct Qdisc_ops pfifo_fast_ops __read_mostly = {
+	.id		=	"pfifo_fast",
+	.priv_size	=	sizeof(struct pfifo_fast_priv),
+    /* enqueue 如果當前隊列中的frame數要小於隊列中最大的數，
+    則通過skb->priority算出band，並通過band索引策略
+    的那個隊列中，最後加入到隊列中。如果超出最大限制，
+    則釋放掉skb。*/
+	.enqueue	=	pfifo_fast_enqueue,
+    /* dequeue 通過priv->bitmap索引數組，隊列分別是0到2一次發送出去 */
+	.dequeue	=	pfifo_fast_dequeue,
+    // peek 僅僅取出數據，但不從隊列中出隊
+	.peek		=	pfifo_fast_peek,
+    // init 初始化函數
+	.init		=	pfifo_fast_init,
+    // 最後reset
+	.reset		=	pfifo_fast_reset,
+	.dump		=	pfifo_fast_dump,
+	.owner		=	THIS_MODULE,
+};
+```
+
+
+
+## linux kernel qdisc基本操作
+
+- `qdisc_reset`:調用Qdisc操作函數中的reset函數
+- `qdisc_destroy`:釋放Qdisc
+- `qdisc_enqueue_tail`:將skb包添加到數據隊列最後
+- `qdisc_dequeue_head`:將隊列頭的數據包出隊列
+- `qdisc_dequeue_tail`:將隊列尾的數據包出隊列
+- `qdisc_reset_queue`:復位Qdisc隊列
+- `qdisc_queue_drop`:丟棄Qdisc數據隊列尾的數據包
+- `qdisc_drop`:丟棄數據包
+- `qdisc_reshape_fail`:整形失敗丟包
+- `qdisc_lookup`:根據句柄查找Qdisc, 句柄是個32位整數用於標識Qdisc的
+- `qdisc_leaf`:返回指定類別的Qdisc葉節點
+- `qdisc_graft`:”嫁接”Qdisc, 將新的Qdisc節點添加到父節點作為葉節點
+- `dev_graft_qdisc`:將qdisc作為頂層Qdisc節點附著於dev設備
+- `qdisc_create`:在指定的網卡設備上創建新的Qdisc結構
+- `qdisc_alloc_handle`:分配新句柄
+- `qdisc_change`:修改Qdisc參數
+
