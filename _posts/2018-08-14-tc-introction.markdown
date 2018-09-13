@@ -73,7 +73,7 @@ Processing of traffic is controlled by three kinds of objects: qdiscs, classes a
 
 ## 流量控制處理對象(objects)： qdisc (排隊規則)、class (類別) 和 filter (過濾器) 
 
-**QDISCS** (how to queue the packets)
+### QDISCS (how to queue the packets)
 
 - Attached to a network interface
 - Can be organized hierarchically with classes
@@ -87,7 +87,8 @@ A simple QDISC is the 'pfifo' one, which does no processing at all and is a pure
 QDisc (排隊規則) 是queueing discipline 的簡寫，它是理解流量控制(traffic control)的基礎。無論何時，內核如果需要通過某個網絡接口發送數據包，它都需要按照爲這個接口配置的qdisc(排隊規則)把數據包加入隊列。然後，內核會儘可能多地從qdisc裏面取出數據包，把它們交給網絡適配器驅動模塊。
 最簡單的QDisc是pfifo它不對進入的數據包做任何的處理，數據包採用先入先出的方式通過隊列。不過，它會保存網絡接口一時無法處理的數據包。 
 
-Classless Qdiscs (無階)
+**Classless Qdiscs (無階)**
+
 - FIFO (First In, First Out) [bfifo, pfifo, pfifo_head_drop]
   - 使用最簡單的qdisc，純粹的先進先出。只有一個參數：limit，用來設置隊列的長度,pfifo是以數據包的個數為單位；bfifo是以字節數為單位
 - Priority queueing [pfifo_fast, prio]
@@ -103,7 +104,8 @@ Classless Qdiscs (無階)
 - tbf (Token Bucket Filter)
   - 適合於把流速降低到某個值
 
-Classful Qdiscs (階級)
+**Classful Qdiscs (階級)**
+
 - CBQ (Class Based Queueing)
   - 實現了一個豐富的連接共享類別結構，既有限制(shaping)帶寬的能力，也具有帶寬優先級管理的能力
   - 帶寬限制是通過計算連接的空閒時間完成的
@@ -116,13 +118,13 @@ Classful Qdiscs (階級)
   - 可以很容易對流量進行優先級管理，只有屬於高優先級類別的數據包全部發送完畢，才會發送屬於低優先級類別的數據包
   - 為了方便管理，需要使用iptables或者ipchains處理數據包的服務類型(Type Of Service,ToS)
 
-**CLASSES**  (tied with qdiscs to form a hierarchy)
+### CLASSES  (tied with qdiscs to form a hierarchy)
 
 Some qdiscs can contain classes, which contain further qdiscs - traffic may then be enqueued in any of the inner qdiscs, which are within the classes.  When the kernel tries to dequeue a packet from such a classful qdisc it can  come  from  any  of  the  classes. A qdisc may for example prioritize certain kinds of traffic by trying to dequeue from certain classes before others.
 
 某些QDisc(排隊規則)可以包含一些類別，不同的類別中可以包含更深入的QDisc(排隊規則)，通過這些細分的QDisc還可以爲進入的隊列的數據包排隊。通過設置各種類別數據包的離隊次序，QDisc可以爲設置網絡數據流量的優先級。
 
-**FILTERS** (how to classify or filter the packets)
+### FILTERS (how to classify or filter the packets)
 
 - As known as classifier
 - Attached to a Qdisc
