@@ -20,6 +20,12 @@ categories: networking
 
 如果相對ingress方向作流量控制的話，可以藉助ifb（ [Intermediate Functional Block](https://wiki.linuxfoundation.org/networking/ifb)）內核模塊。因為流入網絡接口的流量是無法直接控制的，那麼就需要把流入的包導入（通過tc action）到一個中間的隊列，該隊列在ifb 設備上，然後讓這些包重走tc 層，最後流入的包再重新入棧，流出的包重新出棧
 
+graph TD;
+
+Characters-->Token
+Token-->Nodes
+Nodes-->Dom
+
 
 
 ## Components of Linux Traffic Control 
@@ -67,7 +73,13 @@ Processing of traffic is controlled by three kinds of objects: qdiscs, classes a
 
 ## 流量控制處理對象(objects)： qdisc (排隊規則)、class (類別) 和 filter (過濾器) 
 
-**QDISCS**
+**QDISCS** (how to queue the packets)
+
+- Attached to a network interface
+- Can be organized hierarchically with classes
+- Has a unique handle on each interface
+- Almost all qdiscs are for egress
+- Ingress is a special case
 
 qdisc is short for 'queueing discipline' and it is elementary to understanding traffic control. Whenever the kernel needs to send a packet to an interface, it is enqueued to the qdisc configured for that interface. Immediately afterwards, the kernel tries to get as many packets as possible from the qdisc, for giving them to the network adaptor driver.
 A simple QDISC is the 'pfifo' one, which does no processing at all and is a pure First In, First Out queue. It does however store traffic when the network interface can't handle it momentarily.
@@ -76,25 +88,49 @@ QDisc (排隊規則) 是queueing discipline 的簡寫，它是理解流量控制
 最簡單的QDisc是pfifo它不對進入的數據包做任何的處理，數據包採用先入先出的方式通過隊列。不過，它會保存網絡接口一時無法處理的數據包。 
 
 Classless Qdiscs (無階)
-- fifo (First In, First Out)
-- pfifo_fast
+- FIFO (First In, First Out) [bfifo, pfifo, pfifo_head_drop]
+  - 使用最簡單的qdisc，純粹的先進先出。只有一個參數：limit，用來設置隊列的長度,pfifo是以數據包的個數為單位；bfifo是以字節數為單位
+- Priority queueing [pfifo_fast, prio]
+  - 在編譯內核時，如果打開了高級路由器(Advanced Router)編譯選項，pfifo_fast就是系統的標準QDISC。它的隊列包括三個波段(band)。在每個波段裡面，使用先進先出規則。而三個波段(band)的優先級也不相同，band 0的優先級最高，band 2的最低。如果band裡面有數據包，系統就不會處理band 1裡面的數據包，band 1和band 2之間也是一樣。數據包是按照服務類型(Type of Service,TOS)被分配多三個波段(band)裡面的
+- Multiqueue [mq, multiq]
+  - For multiple hardware TX queues
+  - Queue mapping with hash, priority or by classifier
+  - Combine with priority: mq_prio
 - red (Random Early Detection)
+  - 當帶寬的佔用接近於規定的帶寬時，系統會隨機地丟棄一些數據包。適合高帶寬應用
 - sfq (Stochastic Fairness Queueing)
+  - 它按照會話(session–對應於每個TCP連接或者UDP流)為流量進行排序，然後循環發送每個會話的數據包
 - tbf (Token Bucket Filter)
+  - 適合於把流速降低到某個值
 
 Classful Qdiscs (階級)
 - CBQ (Class Based Queueing)
+  - 實現了一個豐富的連接共享類別結構，既有限制(shaping)帶寬的能力，也具有帶寬優先級管理的能力
+  - 帶寬限制是通過計算連接的空閒時間完成的
+  - 空閒時間的計算標準是數據包離隊事件的頻率和下層連接(數據鏈路層)的帶寬
 - HTB (Hierarchy Token Bucket)
+  - 通過在實踐基礎上的改進，它實現了一個豐富的連接共享類別體系。使用HTB可以很容易地保證每個類別的帶寬，雖然它也允許特定的類可以突破帶寬上限，佔用別的類的帶寬
+  - 實現帶寬限制，也能夠劃分類別的優先級
 - PRIO
+  - 不能限制帶寬，因為屬於不同類別的數據包是順序離隊的
+  - 可以很容易對流量進行優先級管理，只有屬於高優先級類別的數據包全部發送完畢，才會發送屬於低優先級類別的數據包
+  - 為了方便管理，需要使用iptables或者ipchains處理數據包的服務類型(Type Of Service,ToS)
 
-**CLASSES**  
+**CLASSES**  (tied with qdiscs to form a hierarchy)
 
 Some qdiscs can contain classes, which contain further qdiscs - traffic may then be enqueued in any of the inner qdiscs, which are within the classes.  When the kernel tries to dequeue a packet from such a classful qdisc it can  come  from  any  of  the  classes. A qdisc may for example prioritize certain kinds of traffic by trying to dequeue from certain classes before others.
 
 某些QDisc(排隊規則)可以包含一些類別，不同的類別中可以包含更深入的QDisc(排隊規則)，通過這些細分的QDisc還可以爲進入的隊列的數據包排隊。通過設置各種類別數據包的離隊次序，QDisc可以爲設置網絡數據流量的優先級。
 
-**FILTERS**
+**FILTERS** (how to classify or filter the packets)
+
+- As known as classifier
+- Attached to a Qdisc
+- The rule to match a packet
+- Need qdisc support
+- Protocol, priority, handle
 
 A filter is used by a classful qdisc to determine in which class a packet will be enqueued. Whenever traffic arrives at a class with subclasses, it needs to be classified. Various methods may be employed to do so, one of these are the filters. All filters attached to the class are called, until one of them returns with a verdict. If no verdict was made, other criteria may be available. This differs per qdisc.
 
 filter(過濾器)用於爲數據包分類，決定它們按照何種QDisc進入隊列。無論何時數據包進入一個劃分子類的類別中，都需要進行分類。分類的方法可以有多種，使用fileter(過濾器)就是其中之一。使用filter(過濾器)分類時，內核會調用附屬於這個類(class)的所有過濾器，直到返回一個判決。如果沒有判決返回，就作進一步的處理，而處理方式和QDISC有關。需要注意的是，filter(過濾器)是在QDisc內部，它們不能作爲主體。 
+
