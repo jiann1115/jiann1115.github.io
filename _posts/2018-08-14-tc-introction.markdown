@@ -20,12 +20,6 @@ categories: networking
 
 如果相對ingress方向作流量控制的話，可以藉助ifb（ [Intermediate Functional Block](https://wiki.linuxfoundation.org/networking/ifb)）內核模塊。因為流入網絡接口的流量是無法直接控制的，那麼就需要把流入的包導入（通過tc action）到一個中間的隊列，該隊列在ifb 設備上，然後讓這些包重走tc 層，最後流入的包再重新入棧，流出的包重新出棧
 
-graph TD;
-
-Characters-->Token
-Token-->Nodes
-Nodes-->Dom
-
 
 
 ## Components of Linux Traffic Control 
@@ -72,6 +66,46 @@ Processing of traffic is controlled by three kinds of objects: qdiscs, classes a
 
 
 ## 流量控制處理對象(objects)： qdisc (排隊規則)、class (類別) 和 filter (過濾器) 
+
+### 簡要描述
+
+- Qdisc: how to queue the packets
+
+- Class: tied with qdiscs to form a hierarchy
+
+- Filter: how to classify or filter the packets
+
+- Action: how to deal with the matched packets
+
+**處理流程**
+
+```
+for_each_packet(pkt, Qdisc):
+  for_each_filter(filter, Qdisc):
+    if filter(pkt):
+      classify(pkt)
+      for_each_action(act, filter):
+        act(pkt)
+```
+
+**代碼源**
+
+- Kernel source code
+
+  net/sched/sch\_\*.c
+
+  net/sched/cls\_\*.c
+
+  net/sched/act_*.c
+
+- iproute2 source code
+
+  tc/q\_\*.c
+
+  tc/f\_\*.c
+
+  tc/m\_\*.c
+
 
 ### QDISCS (how to queue the packets)
 
