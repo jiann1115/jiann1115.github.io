@@ -1,0 +1,939 @@
+---
+1layout: post
+title:  "Linux Traffic Control - htb"
+date:   2018-08-20 00:51:40 -0700
+categories: networking
+---
+
+
+
+# Linux Traffic Control - htb
+
+
+
+> 整理，並轉載至Linux內核中流量控制系列文章。
+>
+> 來源：http://yfydz.cublog.cn
+>
+> 整理 內核代碼版本為3.3
+
+
+
+## 1. HTB(Hierarchical token bucket, 遞階令牌桶)
+
+HTB, 從名稱看就是TBF的擴展, 所不同的是TBF就一個節點處理所有數據, 而HTB是基於分類的流控方法, 以前那些流控一般用一個”tc qdisc”命令就可以完成配置, 而要配置好HTB, 通常情況下tc qdisc, class, filter三種命令都要用到, 用於將不同數據包分為不同的類別, 然後針對每種類別數據再設置相應的流控方法, 因此基於分類的流控方法遠比以前所述的流控方法複雜。
+
+HTB將各種類別的流控處理節點組合成一個節點樹, 每個葉節點是一個流控結構, 可在葉子節點使用不同的流控方法，如將pfifo, tbf等。 HTB一個重要的特點是能設置每種類型的基本帶寬，當本類帶寬滿而其他類型帶寬空閒時可以向其他類型借帶寬。注意這個樹是靜態的, 一旦TC命令配置好後就不變了, 而具體的實現是HASH表實現的, 只是邏輯上是樹, 而且不是二叉樹, 每個節點可以有多個子節點。
+
+HTB運行過程中會將不同類別不同優先權的數據包進行有序排列，用到了有序表, 其數據結構實際是一種特殊的二叉樹, 稱為紅黑樹(Red Black Tree), 這種樹的結構是動態變化的，而且數量不只一個，最大可有8×8個樹。
+
+紅黑樹的特徵是:
+
+1. 每個節點不是紅的就是黑的
+2. 根節點必須是黑的
+3. 所有葉子節點必須也是黑的
+4. 每個紅節點的子節點必須是黑的, 也就是紅節點的父節點必須是黑節點
+5. 從每個節點到最底層節點的所有路徑必須包含相同數量的黑節點
+
+關於紅黑樹的數據結構和操作在include/linux/rbtree.h和lib/rbtree.c中定義.
+
+總結來說，原理為：
+
+某個時刻每個類可以處於三種狀態中的一種:
+
+1. CAN_SEND
+2. MAY_BORROW
+3. CANT_SEND
+
+決策哪個類出包算法：
+
+1. htb算法從類樹的底部開始往上找CAN_SEND狀態的class.如果找到某一層有CAN_SEND狀態的類則停止
+2. 如果該層中有多個class處於CAN_SEND狀態則選取優先級最高(priority最小)的class.如果最高優先級還是有多個class,那就在這些類中輪訓處理.每個類每發送自己的quantum個字節後,輪到下一個類發送
+3. 上面有講到只有leafclass才可以緩存網絡包,innerclass是沒有網絡包的.如果步驟1,2最終選到了innerclass怎麼處理？既然是innerclass,肯定有自己的subclass.innerclass會順著樹往下找,找到一個子孫leafclass.並且該leafclass處於MAY_BORROW狀態,將自己富餘的令牌借給該leafclass讓其出包.同樣的道理,可能會有多個子孫leafclass處於MAY_BORROW狀態,這裡的處理跟步驟2是一樣的
+
+
+
+## 2. HTB操作結構定義
+
+- `htb_cmode`：HTB操作數據包模式。 HTB_CAN_SEND，可以發送, 沒有阻塞；HTB_CANT_SEND，阻塞，不能發生數據包；HTB_MAY_BORROW，阻塞，可以向其他類借帶寬來發送
+- `htb_class`：HTB類別, 用於定義HTB的節點,包括`htb_class_leaf(葉子節點)`, `htb_class_inner(非葉子節點)`
+- `htb_sched`：HTB私有數據結構
+- `htb_class_ops`：HTB類別操作結構，對應於Qdisc_class_ops。有htb_graft(設置葉子節點的流控方法)、htb_leaf(增加子節點)、htb_walk(遍歷)等
+- `htb_qdisc_ops`：HTB流控操作結構
+
+
+
+各種流控算法是通過流控操作結構（Qdisc_ops）實現，在構建新的Qdisc時，需要傳入Qdisc_ops [`qdisc_alloc(struct net_device *dev, struct Qdisc_ops *ops)`]，所以來看看HTB流控隊列的基本操作結構，Qdisc_ops——–`htb_qdisc_ops`
+
+[htb_qdisc_ops](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L1561)
+
+```c
+static struct Qdisc_ops htb_qdisc_ops __read_mostly = {  
+    .cl_ops		=	&htb_class_ops,
+    .id			=	"htb",
+    .priv_size	=	sizeof(struct htb_sched),
+    .enqueue	=	htb_enqueue,
+    .dequeue	=	htb_dequeue,
+    .peek		=	qdisc_peek_dequeued,
+    .drop		=	htb_drop,
+    .init		=	htb_init,
+    .reset		=	htb_reset,
+    .destroy	=	htb_destroy,
+    .dump		=	htb_dump,
+    .owner		=	THIS_MODULE,
+};
+```
+
+接著是HTB流控隊列類別操作結構，Qdisc_class_ops——–`htb_class_ops`
+
+[htb_class_ops](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L1545)
+
+```c
+static const struct Qdisc_class_ops htb_class_ops = {
+	.graft		=	htb_graft,
+	.leaf		=	htb_leaf,
+	.qlen_notify	=	htb_qlen_notify,
+	.get		=	htb_get,
+	.put		=	htb_put,
+	.change		=	htb_change_class,
+	.delete		=	htb_delete,
+	.walk		=	htb_walk,
+	.tcf_chain	=	htb_find_tcf,
+	.bind_tcf	=	htb_bind_filter,
+	.unbind_tcf	=	htb_unbind_filter,
+	.dump		=	htb_dump_class,
+	.dump_stats	=	htb_dump_class_stats,
+};
+```
+
+
+
+## 3. HTB的TC操作命令
+
+為了更好理解HTB各處理函數，先用HTB的配置實例過程來說明各種操作調用了哪些HTB處理函數，以下的配置實例取自HTB Manual, 屬於最簡單分類配置
+
+### 3.1 配置網卡的根流控節點為HTB
+
+```bash
+# 根節點ID是0x10000, 缺省類別是0x10012,
+#handle x:y, x定義的是類別ID的高16位, y定義低16位
+# 注意命令中的ID參數都被理解為16進制的數
+tc qdisc add dev eth0 root handle 1: htb default 12
+```
+
+在內核中將調用htb_init()函數初始化HTB流控結構
+
+### 3.2 建立分類樹
+
+```bash
+# 根節點總流量帶寬100kbps, 內部類別ID是0x10001
+tc class add dev eth0 parent 1: classid 1:1 htb rate 100kbps ceil 100kbps
+# 第一類別數據分30kbps, 最大可用100kbps, 內部類別ID是0x10010(注意這裡確實是16進制的10)
+tc class add dev eth0 parent 1:1 classid 1:10 htb rate 30kbps ceil 100kbps
+# 第二類別數據分30kbps, 最大可用100kbps, 內部類別ID是0x10011
+tc class add dev eth0 parent 1:1 classid 1:11 htb rate 10kbps ceil 100kbps
+# 第三類別(缺省類別)數據分60kbps, 最大可用100kbps, 內部類別ID是0x10012
+tc class add dev eth0 parent 1:1 classid 1:12 htb rate 60kbps ceil 100kbps
+```
+
+在內核中將調用htb_change_class()函數來修改HTB參數
+
+### 3.3 數據包分類
+
+```bash
+# 對源地址為1.2.3.4, 目的端口是80的數據包為第一類, 0x10010
+tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 match ip src 1.2.3.4 match ip
+dport 80 0xffff flowid 1:10
+# 對源地址是1.2.3.4的其他類型數據包是第2類, 0x10011
+tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 match ip src 1.2.3.4 flowid
+1:11
+# 其他數據包將作為缺省類, 0x10012
+```
+
+### 3.4 設置每個葉子節點的流控方法
+
+```bash
+# 1:10節點為pfifo
+tc qdisc add dev eth0 parent 1:10 handle 20: pfifo limit 10
+# 1:11節點也為pfifo
+tc qdisc add dev eth0 parent 1:11 handle 30: pfifo limit 10
+# 1:12節點使用sfq, 擾動時間10秒
+tc qdisc add dev eth0 parent 1:12 handle 40: sfq perturb 10
+```
+
+在內核中會使用htb_leaf()查找HTB葉子節點, 使用htb_graft()函數來設置葉子節點的流控方法
+
+
+
+## 4. 代碼
+
+### 4.1 入隊
+
+[htb_enqueue](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L549)
+
+```c
+static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+{
+	int uninitialized_var(ret);
+	struct htb_sched *q = qdisc_priv(sch);
+	struct htb_class *cl = htb_classify(skb, sch, &ret);
+
+	if (cl == HTB_DIRECT) {
+        // 分類結果是直接發送
+		/* enqueue to helper queue */
+		if (q->direct_queue.qlen < q->direct_qlen) {
+            // 如果直接發送隊列中的數據包長度小於直接發送隊列長度最大值, 將數據包添加到隊列末尾
+			__skb_queue_tail(&q->direct_queue, skb);
+			q->direct_pkts++;
+		} else {
+            // 否則丟棄數據包
+			kfree_skb(skb);
+			sch->qstats.drops++;
+			return NET_XMIT_DROP;
+		}
+#ifdef CONFIG_NET_CLS_ACT
+	} else if (!cl) {
+        // 分類沒有結果, 丟包
+		if (ret & __NET_XMIT_BYPASS)
+			sch->qstats.drops++;
+		kfree_skb(skb);
+		return ret;
+#endif
+	// 有分類結果, 進行分類相關的葉子節點流控結構(3.4中為葉子節點設置的流控，例如pfifo)的入隊操作
+	} else if ((ret = qdisc_enqueue(skb, cl->un.leaf.q)) != NET_XMIT_SUCCESS) {
+        // 入隊不成功的話丟包
+		if (net_xmit_drop_count(ret)) {
+			sch->qstats.drops++;
+			cl->qstats.drops++;
+		}
+		return ret;
+	} else {
+        // 入隊成功, 分類結構的包數字節數的統計數增加
+		bstats_update(&cl->bstats, skb);
+        // 激活HTB類別, 建立該類別的數據提供樹, 這樣dequeue時可以從中取數據包
+        // 只有類別節點的模式是可發送和可租借的情況下才會激活, 如果節點是阻塞模式, 則不會被激活
+		htb_activate(q, cl);
+	}
+
+    // HTB流控結構統計數更新, 入隊成功
+	sch->q.qlen++;
+	return NET_XMIT_SUCCESS;
+}
+```
+
+大部分情況下數據包都不會進入直接處理隊列, 而是進入各類別葉子節點, 因此入隊的成功與否就在於葉子節點使用何種流控算法, 大都應該可以入隊成功的， 入隊不涉及類別節點模式的調整
+
+接下來再看看htb_activate(q, cl)
+
+```
+htb_enqueue()
+	-> htb_activate(q, cl)
+```
+
+[htb_activate](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L522)
+
+```c
+/**
+ * htb_activate - inserts leaf cl into appropriate active feeds
+ *                將葉子節點cl插入適合的active self feed中
+ *
+ * Routine learns (new) priority of leaf and activates feed chain
+ * for the prio. It can be called on already active leaf safely.
+ * It also adds leaf into droplist.
+ * Routine學習(新的)葉子節點優先級，並根據優先級激活feed chain。它可以安全地調用已經激活的葉子
+ * 它也可以將葉子節點添加到droplist中
+ * 激活類別結構, 將該類別節點作為數據包提供者, 而數據類別表提供是一個有序表, 以RB樹形式實現
+ */
+static inline void htb_activate(struct htb_sched *q, struct htb_class *cl)
+{
+	WARN_ON(cl->level || !cl->un.leaf.q || !cl->un.leaf.q->q.qlen);
+    // 如果類別的prio_activity參數為0才進行操作, 非0表示已經激活了
+    // leaf.aprio保存當前的leaf.prio
+
+	if (!cl->prio_activity) {
+        // prio_activity是通過葉子節點的prio值來設置的, 至少是1, 最大是1<<7, 非0值
+		cl->prio_activity = 1 << cl->prio;
+        // 進行實際的激活操作
+		htb_activate_prios(q, cl);
+        // 根據leaf.aprio添加到指定的優先權位置的丟包鍊錶
+		list_add_tail(&cl->un.leaf.drop_list,
+			      q->drops + cl->prio);
+	}
+}
+
+```
+
+接下來再到htb_activate_prios(q, cl)
+
+```
+htb_enqueue()
+	-> htb_activate()
+		-> htb_activate_prios(q, cl)
+```
+
+> ```
+> # class顏色提示
+> 0=Red=HTB_CANT_SEND
+> 1=Yellow=HTB_MAY_BORROW
+> 2=Green=HTB_CAN_SEND
+> ```
+
+
+
+[htb_activate_prios](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L373)
+
+```c
+/**
+ * htb_activate_prios - creates active classe's feed chain
+ *                      創建active class的feed chain
+ *
+ * The class is connected to ancestors and/or appropriate rows
+ * for priorities it is participating on. cl->cmode must be new
+ * (activated) mode. It does nothing if cl->prio_activity == 0.
+ * 這裡的class必須是根據優先級連接到祖先節點的inner self或者合適的rows(self feed)
+ * cl->cmode必須是new (activated) mode。
+ * 如果cl->prio_activity == 0,就是一個空函數
+ * 不過從前面看prio_activity似乎是不會為0的激活操作
+ */
+static void htb_activate_prios(struct htb_sched *q, struct htb_class *cl)
+{
+	struct htb_class *p = cl->parent;
+	// prio_activity是作為一個掩碼, 應該只有一位為1
+	long m, mask = cl->prio_activity;
+
+    // 在當前模式是HTB_MAY_BORROW情況下進入循環, 某些情況下這些類別是可以激活的
+    // 絕大多數情況p和mask的初始值應該都是非0值
+	while (cl->cmode == HTB_MAY_BORROW && p && mask) {
+        // 掩碼取反, 找第一個0位的位置（從0開始計數）, 也就是原來最低為1的位的位置
+        // prio越小, 等級越高, 取數據包也是先從prio值小的節點取
+		m = mask;
+		while (m) {
+            // 掩碼取反, 找第一個0位的位置（從0開始計數）, 也就是原來最低為1的位的位置
+            // prio越小, 等級越高, 取數據包也是先從prio值小的節點取
+			int prio = ffz(~m);
+            // 清除該位
+			m &= ~(1 << prio);
+
+            // p是父節點, 所以inner結構肯定有效, 不會使用leaf結構的
+            // 如果父節點的prio優先權的數據包的提供樹已經存在, 在掩碼中去掉該位
+			if (p->un.inner.feed[prio].rb_node)
+				/* parent already has its feed in use so that
+				 * reset bit in mask as parent is already ok
+				 */
+				mask &= ~(1 << prio);
+
+			// 將該類別加到父節點的prio優先權提供數據包的節點樹中，
+			// 即由於子class是yellow，所以將其按優先級添加到父class的inner feed中
+			htb_add_to_id_tree(p->un.inner.feed + prio, cl, prio);
+		}
+		// 父節點的prio_activity或上mask中的置1位, 某位為1表示該位對應的優先權的數據可用
+		// 表示inner feed中與該子class的連線
+		p->prio_activity |= mask;
+        // 循環到上一層, 當前類別更新父節點, 父節點更新為祖父節點
+        // 如果父節點也變yellow，需要將父節點也添加到祖父節點的inner feed中
+		cl = p;
+		p = cl->parent;
+
+	}
+    // 如果cl是HTB_CAN_SEND模式, 將該類別添加到合適的ROW（self feed）中
+    // 此時的cl可能已經不是原來的cl了,而是原cl的長輩節點了
+	if (cl->cmode == HTB_CAN_SEND && mask)
+		htb_add_class_to_row(q, cl, mask);
+}
+```
+
+接下來需要分別看htb_add_to_id_tree()和htb_add_class_to_row()
+
+
+
+```
+htb_enqueue()
+	-> htb_activate()
+		-> htb_activate_prios(q, cl)		
+			//當class是yellow
+			-> htb_add_to_id_tree(p->un.inner.feed + prio, cl, prio) <-----
+			-> htb_add_class_to_row()
+```
+
+
+
+[htb_add_to_id_tree](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L249)
+
+```c
+/**
+ * htb_add_to_id_tree - adds class to the round robin list
+ *
+ * Routine adds class to the list (actually tree) sorted by classid.
+ * Make sure that class is not already on such list for given prio.
+ * Routine 將class添加到根據classid存儲的list中（實際上是一棵樹）
+ * 確保給定優先級的class之前沒有存儲在該list中
+ * @root: 傳入的是p->un.inner.feed + prio，inner.feed是rb_boot數組，struct rb_root feed[TC_HTB_NUMPRIO]
+ * @cl: 要加入rb數的子節點
+ * @prio: 子節點的優先級
+ */
+static void htb_add_to_id_tree(struct rb_root *root,
+			       struct htb_class *cl, int prio)
+{
+	struct rb_node **p = &root->rb_node, *parent = NULL;
+    // RB樹是有序表, 根據類別ID排序, 值大的到右節點, 小的到左節點
+    // 循環, 查找樹中合適的位置插入類別節點cl
+	while (*p) {
+		struct htb_class *c;
+		parent = *p;
+		c = rb_entry(parent, struct htb_class, node[prio]);
+
+		if (cl->common.classid > c->common.classid)
+			p = &parent->rb_right;
+		else
+			p = &parent->rb_left;
+	}
+    // 進行RB樹的插入操作, RB樹標準函數操作
+	rb_link_node(&cl->node[prio], parent, p);
+	rb_insert_color(&cl->node[prio], root);
+}
+```
+
+
+
+接著來到htb_add_class_to_row()
+
+```
+htb_enqueue()
+	-> htb_activate()
+		-> htb_activate_prios(q, cl)
+			-> htb_add_to_id_tree(p->un.inner.feed + prio, cl, prio)
+			//當class是green
+			-> htb_add_class_to_row() <-----
+```
+
+```c
+/** 
+ * htb_add_class_to_row - 将class添加到它所在level的self feed 
+ * 
+ * 根据优先级掩码，将class添加到它所在level的row，即self feed 
+ * 如果mask==0,将什么也不做
+ */ 
+static inline void htb_add_class_to_row(struct htb_sched *q,
+					struct htb_class *cl, int mask)
+{
+	//htb_sched的row_mask表示该层的哪些优先权值的树有效
+	// 将cl层次对应的ROW的row_mask或上新的mask, 表示有对应prio的数据了 
+	q->row_mask[cl->level] |= mask;
+	// 循环mask, 将cl插入mask每一位对应的prio的树中 
+	while (mask) {
+		// prio是mask中最低为1的位的位置 
+		int prio = ffz(~mask);
+		// 清除该位
+		mask &= ~(1 << prio);
+		// 添加到具体的RB树中，即cl所在层次的self feed对应优先级的RB树
+		htb_add_to_id_tree(q->row[cl->level] + prio, cl, prio);
+	}
+}
+```
+
+#### 入隊操作總結
+
+1. 斷數據包類型：
+
+   a.drop
+
+   b.直接發送
+
+   c.添加到葉子節點。以下只分享添加到葉子節點的類型
+
+2. 將數據包添加到葉子節點的流控結構體如pfifo
+
+3. 調用htb_activate激活HTB類別，建立該類別的數據提供數，這樣dequeue時可以從中取數據包
+
+4. 獲取葉子節點的優先級，調用htb_activate_prios進行實際的激活操作
+
+5. htb_activate_prios中分兩類進行：
+
+   a.對於yellow類型的class，將其添加到父class的feed（inner feed）中
+
+   b.對於green類型的class，將其添加到class所在level的row（self feed）中
+
+
+
+### 4.2 出隊
+
+HTB的出隊是個非常複雜的處理過程, 函數調用過程為
+
+```
+htb_dequeue <-----
+	-> __skb_dequeue
+	-> htb_do_events
+		-> htb_safe_rb_erase
+		-> htb_change_class_mode
+		-> htb_add_to_wait_tree
+	-> htb_dequeue_tree
+		-> htb_lookup_leaf
+		-> htb_deactivate
+		-> q->dequeue
+		-> htb_next_rb_node
+		-> htb_charge_class
+			-> htb_change_class_mode
+			-> htb_safe_rb_erase
+			-> htb_add_to_wait_tree
+```
+
+[htb_dequeue](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L788)
+
+```c
+static struct sk_buff *htb_dequeue(struct Qdisc *sch)
+{
+	struct sk_buff *skb;
+	struct htb_sched *q = qdisc_priv(sch);
+	int level;
+	psched_time_t next_event;
+	unsigned long start_at;
+
+	/* try to dequeue direct packets as high prio (!) to minimize cpu work */
+    // 先從當前直接發送隊列取數據包, 直接發送隊列中的數據有最高優先級, 可以說沒有流量限制
+	skb = __skb_dequeue(&q->direct_queue);
+	if (skb != NULL) {
+ok:
+        // 從直接發送隊列中取到數據包, 更新參數, 非阻塞, 返回數據包
+		qdisc_bstats_update(sch, skb);
+		qdisc_unthrottled(sch);
+		sch->q.qlen--;
+		return skb;
+	}
+
+    // 如果HTB流控結構隊列長度為0, 返回空
+	if (!sch->q.qlen)
+		goto fin;
+    // 獲取當前有效時間值
+	q->now = psched_get_time();
+    // 起始時滴答數
+	start_at = jiffies;
+
+    // 最大延遲5秒
+	next_event = q->now + 5 * PSCHED_TICKS_PER_SEC;
+
+    // 遍歷節點樹（靜態）的所有層次, 從葉子節點開始
+	for (level = 0; level < TC_HTB_MAXDEPTH; level++) {
+		/* common case optimization - skip event handler quickly */
+		int m;
+        // event sched time
+		psched_time_t event;
+
+        // 計算延遲值, 是取數據包失敗的情況下更新HTB定時器的延遲時間
+        // 比較ROW樹中該層節點最近的事件定時時間是否已經到了
+		if (q->now >= q->near_ev_cache[level]) {
+            // 時間到了, 處理HTB事件, 返回值是下一個事件的延遲時間
+            // 對第level號等待樹的類別節點進行模式調整，即white slot裡面的class，一會再詳細看
+			event = htb_do_events(q, level, start_at);  // 請看4.2.1 htb_do_events
+			if (!event)
+				event = q->now + PSCHED_TICKS_PER_SEC; // 1秒的滴答數
+            // 更新本層最近定時時間
+			q->near_ev_cache[level] = event;
+		} else
+            // 時間還沒到, 計算兩者時間差
+			event = q->near_ev_cache[level];
+
+		if (next_event > event)
+			next_event = event;
+        
+        // 該層次的row_mask取反, 實際是為找到row_mask[level]中為1的位, 為1表示該樹有數據包可用
+        // row中的節點都是green，也就是CAN_SEND
+		m = ~q->row_mask[level];
+		while (m != (int)(-1)) {
+            // m的數據位中第一個0位的位置作為優先級值, 從低位開始找, 也就是prio越小, 實際數據的優先權越大, 越先出隊
+            // 找出同一層取優先級高的
+			int prio = ffz(m);
+
+            // 將該0位設置為1, 也就是清除該位
+			m |= 1 << prio;
+            // 從該優先權值的流控樹中進行出隊操作
+			skb = htb_dequeue_tree(q, prio, level);
+            // 數據包出隊成功, 更新參數, 退出循環, 返回數據包
+            // 取數據包成功就要去掉流控節點的阻塞標誌
+			if (likely(skb != NULL))
+				goto ok;
+		}
+	}
+    // 循環結束也沒取到數據包, 隊列長度非0卻不能取出數據包, 表示流控節點阻塞
+    // 進行阻塞處理, 調整HTB定時器, 最大延遲5秒
+	sch->qstats.overlimits++;
+    // Use workqueue to schedule after too many events
+	if (likely(next_event > q->now))
+		qdisc_watchdog_schedule(&q->watchdog, next_event);
+	else
+		schedule_work(&q->work); // workqueue
+fin:
+	return skb;
+}
+```
+
+可以看到，dequeue主要分為三個部分，下面就從4.2.1和4.2.2分別來看htb_do_events()、htb_dequeue_tree()
+
+#### 4.2.1 [htb_do_events](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L669)
+
+```
+htb_dequeue 
+	-> __skb_dequeue  
+	-> htb_do_events(q, level) <-----
+		-> htb_safe_rb_erase  
+		-> htb_change_class_mode  
+		-> htb_add_to_wait_tree  
+	-> htb_dequeue_tree
+```
+
+```c
+/**
+ * htb_do_events - make mode changes to classes at the level
+ * htb_do_events - 對第level號等待樹的類別節點進行模式調整
+ *
+ * Scans event queue for pending events and applies them. Returns time of
+ * next pending event (0 for no event in pq, q->now for too many events).
+ * Note: Applied are events whose have cl->pq_key <= q->now.
+ *
+ * 掃描event隊列,發現pending event然後應用它們。
+ * 返回下一個pending event的時間jiffies，如果pq沒有event，則返回0
+ */
+static psched_time_t htb_do_events(struct htb_sched *q, int level,
+				   unsigned long start)
+{
+	/* don't run for longer than 2 jiffies; 2 is used instead of
+	 * 1 to simplify things when jiffy is going to be incremented
+	 * too soon
+	 */
+	unsigned long stop_at = start + 2;
+	while (time_before(jiffies, stop_at)) {
+		struct htb_class *cl;
+		long diff;
+        // q->wait_pq[]：等待隊列，用來掛載哪些帶寬超出限制的節點
+        // 取等待rb樹第一個節點, 每次循環都從樹中刪除一個節點
+		struct rb_node *p = rb_first(&q->wait_pq[level]);
+
+        // 沒節點, 事件空, 返回0表示沒延遲
+		if (!p)
+			return 0;
+
+        // 獲取該節點對應的HTB類別
+		cl = rb_entry(p, struct htb_class, pq_node);
+        // 該類別延遲處理時間是在當前時間後面, 返回pending event的時間jiffies
+		if (cl->pq_key > q->now)
+			return cl->pq_key;
+
+        // 時間小於當前時間了, 已經超時了
+        // 安全地將該節點p從等待RB樹中斷開
+		htb_safe_rb_erase(p, q->wait_pq + level);
+        // 當前時間和檢查點時間的差值
+        // 根據當前時間和上次流控計算時間的時間差來計算可用的令牌量
+        // 計算從上次發送數據包到現在的時間裡生成的令牌數，然後把diff加上原先桶中的令牌數就為總的令牌數，當然總的令牌數是不能比桶大的
+		diff = psched_tdiff_bounded(q->now, cl->t_c, cl->mbuffer);
+        // 根據時間差值更改該類別模式
+		htb_change_class_mode(q, cl, &diff);
+        // 如果不是可發送模式, 重新插入回等待樹
+		if (cl->cmode != HTB_CAN_SEND)
+			htb_add_to_wait_tree(q, cl, diff);
+	}
+
+	/* too much load - let's continue after a break for scheduling */
+	if (!(q->warned & HTB_WARN_TOOMANYEVENTS)) {
+		pr_warning("htb: too many events!\n");
+		q->warned |= HTB_WARN_TOOMANYEVENTS;
+	}
+
+	return q->now;
+}
+```
+
+接著再來看看[htb_change_class_mode()](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L498)
+
+```
+htb_dequeue 
+	-> __skb_dequeue  
+	-> htb_do_events(q, level) 
+		-> htb_safe_rb_erase  
+		-> htb_change_class_mode(q, cl, &diff) <-----
+		-> htb_add_to_wait_tree  
+	-> htb_dequeue_tree
+```
+
+```c
+/**
+ * htb_change_class_mode - changes classe's mode
+ *                         調整類別節點的發送模式
+ *
+ * This should be the only way how to change classe's mode under normal
+ * cirsumstances. Routine will update feed lists linkage, change mode
+ * and add class to the wait event queue if appropriate. New mode should
+ * be different from old one and cl->pq_key has to be valid if changing
+ * to mode other than HTB_CAN_SEND (see htb_add_to_wait_tree).
+ * 這個函數應該是在正常情況下唯一的改變class發送模式的方法。 R
+ * outine會更新self feed list連接關係，改變class的模式或將class添加到合適的wait event隊列中。
+ * 新模式應該與舊模式不一樣，而且如果改變後的模式不是HTB_CAN_SEND（看htb_add_to_wait_tree），
+ * 那麼cl->pq_key必須有效
+ */
+static void
+htb_change_class_mode(struct htb_sched *q, struct htb_class *cl, long *diff)
+{
+    // 根據變化值計算新模式
+	enum htb_cmode new_mode = htb_class_mode(cl, diff);
+
+    // 模式沒變, 返回
+	if (new_mode == cl->cmode)
+		return;
+
+    // cl->prio_activity非0表示是活動的節點, 需要停止後再更新模式
+	if (cl->prio_activity) {	/* not necessary: speed optimization */
+        // 如原來的模式為可發送數據, 先停該節點
+		if (cl->cmode != HTB_CANT_SEND)
+			htb_deactivate_prios(q, cl);
+        // 更新模式
+		cl->cmode = new_mode;
+        // 如果新模式不是禁止發送, 重新激活節點
+		if (new_mode != HTB_CANT_SEND)
+			htb_activate_prios(q, cl);
+	} else
+        // 非活動類別節點, 直接更新模式值
+		cl->cmode = new_mode;
+}
+```
+
+接著繼續看看[htb_class_mode()](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L472)
+
+```
+htb_dequeue 
+	-> __skb_dequeue  
+	-> htb_do_events(q, level) 
+		-> htb_safe_rb_erase  
+		-> htb_change_class_mode() 
+			-> htb_class_mode(cl, diff) <-----
+		-> htb_add_to_wait_tree  
+	-> htb_dequeue_tree
+```
+
+```c
+/**
+ * htb_class_mode - computes and returns current class mode
+ * htb_class_mode - 計算並返回類節點的模式
+ *
+ * It computes cl's mode at time cl->t_c+diff and returns it. If mode
+ * is not HTB_CAN_SEND then cl->pq_key is updated to time difference
+ * from now to time when cl will change its state.
+ * Also it is worth to note that class mode doesn't change simply
+ * at cl->{c,}tokens == 0 but there can rather be hysteresis of
+ * 0 .. -cl->{c,}buffer range. It is meant to limit number of
+ * mode transitions per time unit. The speed gain is about 1/6.
+ * 該函數根據cl->tc+diff（tc為檢查時間點）計算class的模式。
+ * 如果模式不是HTB_CAN_SEND，那麼cl->pq_key更新為現在時間和class改變狀態時間的差
+ * class模式不是簡單地改變 cl->{c,}tokens == 0，而是滯後地改為0..-cl->{c,}的緩存範圍
+ * 這意味著限制單位時間內模式改變的次數，速度的增加大概是1/6
+ */
+static inline enum htb_cmode
+htb_class_mode(struct htb_class *cl, long *diff)
+{
+	long toks;
+    /* 計算類別的Ceil令牌，tokens表示當前令牌數，ctokens表示峰值令牌數
+     * htb_lowater():如果cmode是HTB_CANT_SEND,返回0，否則返回 -cl->cbuffer
+     * 這裡ctokens是租借模式下令牌數，經過一段時間後令牌數就會進行補充。
+     * 待補充後仍然小於低水位線，則狀態變為HTB_CANT_SEND（不能進行發送），
+     * 這裡htb_lowater低水位線根據當前類的模式不同而不同，如果當前類模式
+     * 為HTB_CANT_SEND，則低水位線的值為-cl->cbuffer，也
+     * 就是租借模式下單包最大可傳達數據所需要的ticket，其它模塊下低水位線的值為0
+     */
+	if ((toks = (cl->ctokens + *diff)) < htb_lowater(cl)) {
+        //返回還需要多少令牌
+		*diff = -toks;
+        // 如果令牌小於低限, 模式為不可發送
+		return HTB_CANT_SEND;
+	}
+    /* 計算類別的普通令牌
+     * 如果令牌大於高限, 模式為可發送
+     * htb_hiwater():如果cmode是HTB_CAN_SEND，返回-cl->buffer，否則0
+     * 這裡tokens是非租借模式下令牌數，經過一段時間補充後，
+     * 如果高於高水位線，則狀態變為HTB_CAN_SEND（可以發送）
+     */
+	if ((toks = (cl->tokens + *diff)) >= htb_hiwater(cl))
+		return HTB_CAN_SEND;
+    // 否則模式為可藉，返回還需要多少令牌
+	*diff = -toks;
+	return HTB_MAY_BORROW;
+}
+```
+
+下面重新回到dequeue主線，往下看，到了[htb_dequeue_tree()](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L788)
+
+#### 4.2.2 htb_dequeue_tree
+
+```
+htb_dequeue 
+	-> __skb_dequeue  
+	-> htb_do_events  
+	-> htb_dequeue_tree <-----
+		-> htb_lookup_leaf  
+		-> htb_deactivate  
+		-> q->dequeue  
+		-> htb_next_rb_node  
+		-> htb_charge_class
+```
+
+
+
+```c
+/* dequeues packet at given priority and level; call only if
+ * you are sure that there is active class at prio/level
+ * 從指定層次和優先級的RB數節點中取數據包
+ * 只有在確定該level該優先級可以active時才調用該函數
+ */
+static struct sk_buff *htb_dequeue_tree(struct htb_sched *q, int prio,
+					int level)
+{
+	struct sk_buff *skb = NULL;
+    //cl用於循環中做temp，start是記錄首個循環的節點，用來結束循環)
+	struct htb_class *cl, *start;
+	/* look initial class up in the row */
+    /* 根據層次和優先權值查找起始類別節點
+     * 找到該level 該priority下的一個leafclass
+     * 如果這個節點是葉子節點，那麼它必然是green的
+     * 如果這個節點是inner class，那麼它是green的，就會找它的子孫葉子節點，
+     * 而這個葉子節點必然是yellow的，該inner class可以向它的子孫葉子節點“借”出帶寬。
+     */
+	start = cl = htb_lookup_leaf(q->row[level] + prio, prio,
+				     q->ptr[level] + prio,
+				     q->last_ptr_id[level] + prio);
+
+	do {
+next:
+        // 如果類別為空, 返回數據包為空
+		if (unlikely(!cl))
+			return NULL;
+
+		/* class can be empty - it is unlikely but can be true if leaf
+		 * qdisc drops packets in enqueue routine or if someone used
+		 * graft operation on the leaf since last dequeue;
+		 * simply deactivate and skip such class
+		 */
+        /*
+         * class隊列可以是空的---如果葉子節點的qdisc在入隊時就drop掉數據包
+         * 或者如果someone在上一次dequeue時候對葉子節點使用graft操作（）
+         * 如果遇到class隊列為空，則deactivate或skip
+         * 如果隊列長度為0, 隊列空的情況, 可能性較小
+         */
+		if (unlikely(cl->un.leaf.q->q.qlen == 0)) {
+			struct htb_class *next;
+            // 該類別隊列中沒數據包了, 停止該類別結構
+			htb_deactivate(q, cl);
+
+			/* row/level might become empty */
+            // 掩碼該位為0， 表示該層該prio的rb樹為空, 沒有數據提供樹， 返回數據包為空
+            // 即該level的self feed的該prio為空
+			if ((q->row_mask[level] & (1 << prio)) == 0)
+				return NULL;
+
+            // 否則重新查找該層該優先權的RB樹節點class，同層級同優先級可以有多個class
+			next = htb_lookup_leaf(q->row[level] + prio,
+					       prio, q->ptr[level] + prio,
+					       q->last_ptr_id[level] + prio);
+
+            // 從新找到的這個類別結構cl開始循環, 找隊列非空的節點
+			if (cl == start)	/* fix start if we just deleted it */
+				start = next;
+			cl = next;
+            // 這個goto形成了大循環中的小循環, 找隊列長度非空的類別節點
+			goto next;
+		}
+        // 以下是隊列長度非空的情況, 運行該類別結構的內部流控節點的出隊操作,
+        // 這主要看該節點使用那種流控算法了, 如tbf之類就可以實現流量限制
+		skb = cl->un.leaf.q->dequeue(cl->un.leaf.q);
+        // 取得數據包, 中斷循環準備返回
+		if (likely(skb != NULL))
+			break;
+
+        // 沒取得數據包, 打印警告信息, 該信息在循環中只打印一次
+		qdisc_warn_nonwc("htb", cl->un.leaf.q);
+        /* 更新到下一個rb樹節點，即查找下一個該層級該優先級的節點
+         * 如果現在level!=0，就說明進行dequeue_tree操作的是個inner class，
+         * 那麼cl就是這個inner class的子孫葉子節點，
+         * 所以傳入的是cl父節點的inner class所在的rb數指針
+         * level=0則就是葉子節點，傳入的是葉子節點所在rb樹的指針
+         */
+		htb_next_rb_node((level ? cl->parent->un.inner.ptr : q->
+				  ptr[0]) + prio);
+        // 繼續查找該層該優先權另一個class的RB樹中找葉子類別節點, 循環
+		cl = htb_lookup_leaf(q->row[level] + prio, prio,
+				     q->ptr[level] + prio,
+				     q->last_ptr_id[level] + prio);
+
+	} while (cl != start);
+
+    // 找到數據包的情況, 可能性很大
+	if (likely(skb != NULL)) {
+        // deficit[level] 扣掉該包的byte數
+        // 計算赤字deficit, 減數據包長度, 而deficit是初始化為0的
+        // 當出隊一個數據包時,類對應的deficit[level]扣減包的byte數,
+        // 當deficit[level]<0時說明該類已經發送了quantum.
+        // 於是雖然再次給deficit[level]加了quantum,
+        // 但是htb_next_rb_node((level ? cl->parent->un.inner.ptr : q->
+        // ptr[0]) + prio)已經將該
+        // 層該優先級的出包類指針指向下一個類了.下發出包,將會出另一個類.
+		cl->un.leaf.deficit[level] -= qdisc_pkt_len(skb);
+		if (cl->un.leaf.deficit[level] < 0) {
+            // 如果該類別節點的赤字為負, 增加一個定額量, 缺省是物理網卡的隊列長度
+			cl->un.leaf.deficit[level] += cl->quantum;
+            // 當deficit[level]<0時說明該類已經發送了quantum.需要發送同層級同優先級的下一個類了.
+            // 同上，更新到下一個rb樹節點，即查找下一個該層級該優先級的節點
+			htb_next_rb_node((level ? cl->parent->un.inner.ptr : q->
+					  ptr[0]) + prio);
+		}
+        // 如果赤字為正就不會進行RB數節點的更換
+		/* this used to be after charge_class but this constelation
+		 * gives us slightly better performance
+		 */
+        // 如果隊列空了, 停止該類別
+		if (!cl->un.leaf.q->q.qlen)
+			htb_deactivate(q, cl);
+        // 更新令牌.
+        // 處理該流控節點以及其所有父節點的令牌情況, 調整該類別的
+		htb_charge_class(q, cl, level, skb);
+	}
+	return skb;
+}
+```
+
+
+
+##### 總結htb_dequeue_tree
+
+1. 根據傳入的層級和優先級獲取class，調用htb_lookup_leaf(),如果是葉子節點就返回本身，如果是inner class則找到其子孫葉子節點
+2. 如果以上獲得的葉子節點沒有數據，則停止該節點，並尋找下一個同層級同優先級的節點，直到找到一個有數據包的節點
+3. 取出數據包，如果包不為空，則”next”中斷循環，獲得數據包，否則進行4.”next”循環就是為了獲得一個隊列不是空的節點
+4. 在之前的節點樹中都沒找到數據包，則換一顆節點樹，如果形參中傳入的是inner class，則換一個同層級同優先級的inner class，獲取它的葉子節點，否則就獲得同層級同優先級的葉子節點
+5. 一直循到1.,除非循環到重複的節點或者是找到了數據包，結束循環
+6. 獲得要發送的數據包，計算deficit赤字，如果deficit[level]<0時說明該類已經發送了quantum.需要發送同層級同優先級的下一個類
+7. 如果隊列空了, 停止該類別
+8. 處理該流控節點以及其所有父節點的令牌情況, 調整該類別的模式cmode
+
+
+
+#### 4.3 **其他操作（不詳細介紹）**
+
+- `htb_requeue`:重入隊
+- `htb_dequeue_tree`:從指定的層次和優先權的RB樹節點中取數據包
+- `htb_lookup_leaf`:查找葉子分類節點
+- `htb_charge_class`:關於類別節點的令牌和緩衝區數據的更新計算, 調整類別節點的模式
+- `htb_change_class_mode`:調整類別節點的發送模式
+- `htb_class_mode`:計算類別節點的模式
+- `htb_add_to_wait_tree`:將類別節點添加到等待樹
+- `htb_do_events(struct htb_sched *q, int level)`:對第level號等待樹的類別節點進行模式調整
+
+HTB的流控就體現在通過令牌變化情況計算類別節點的模式, 如果是CAN_SEND就能繼續發送數據, 該節點可以留在數據包提供樹中; 如果阻塞CANT_SEND該類別節點就會從數據包提供樹中拆除而不能發包; 如果模式是CAN_BORROW的則根據其他節點的帶寬情況來確定是否能留在數據包提供樹而繼續發包, 不在提供樹中, 即使有數據包也只能阻塞著不能發送,這樣就實現了流控管理。
+
+為理解分類型流控算法的各種參數的含義, 最好去看一下RFC 3290
+
+
+
+
+
+
+
+
+
+[static struct sk_buff *htb_dequeue(struct Qdisc *sch)](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L856)
+
+
+
