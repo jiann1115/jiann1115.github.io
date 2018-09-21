@@ -60,7 +60,7 @@ struct Qdisc noop_qdisc = {
 
 ## 數據結構 Qdisc(queueing discipline) 
 
-struct Qdisc [sch_generic.h#L45](https://elixir.bootlin.com/linux/v3.3/source/include/net/sch_generic.h#L45)
+### struct Qdisc [sch_generic.h#L45](https://elixir.bootlin.com/linux/v3.3/source/include/net/sch_generic.h#L45)
 
 ```c
 struct Qdisc {
@@ -114,7 +114,7 @@ struct Qdisc {
 
 
 
-struct Qdisc_ops [sch_generic.h#L150](https://elixir.bootlin.com/linux/v3.3/source/include/net/sch_generic.h#L150)
+### struct Qdisc_ops [sch_generic.h#L150](https://elixir.bootlin.com/linux/v3.3/source/include/net/sch_generic.h#L150)
 
 ```c
 struct Qdisc_ops {
@@ -166,7 +166,7 @@ ops->reset
 
 ops->destroy
 
-以default pfifo_fast_opt	來看  [sch_generic.c#L535](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L535)
+### 以default pfifo_fast_opt為例	來看  [sch_generic.c#L535](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_generic.c#L535)
 
 ```c
 struct Qdisc_ops pfifo_fast_ops __read_mostly = {
