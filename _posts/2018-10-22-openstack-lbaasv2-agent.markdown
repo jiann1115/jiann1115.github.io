@@ -13,9 +13,9 @@ categories: networking
 
 Reference:
 
-https://wiki.openstack.org/wiki/Neutron/LBaaS/Agent
+[https://wiki.openstack.org/wiki/Neutron/LBaaS/Agent](https://wiki.openstack.org/wiki/Neutron/LBaaS/Agent)
 
-https://wiki.openstack.org/wiki/Neutron/LBaaS/Architecture
+[https://wiki.openstack.org/wiki/Neutron/LBaaS/Architecture](https://wiki.openstack.org/wiki/Neutron/LBaaS/Architecture)
 
 ## 1.1 Plugin part
 
@@ -61,7 +61,7 @@ service_plugins = neutron_lbaas.services.loadbalancer.plugin.LoadBalancerPluginv
 
 ```
 
-![1540200124452](./1540200124452.png)
+![1540200124452](/images/openstack/1540200124452.png)
 
 ```
 # PATH = /opt/stack/neutron-lbaas/neutron-lbaas/
@@ -84,7 +84,7 @@ There are two types of locks:
 - Object-level lock is done on an instance (vip, pool, member) and restricts concurrent changes. The lock is achieved by moving object  into one of PENDING_* states.
 - Device-level lock is done to lock the whole configuration and disallow concurrent changes. Since this is a restrictive policy, requests are actually put into queue and then processed by driver one-by-one. The      queue may be implemented completely as Python code or be an external MQ.
 
-![1540200558346](./1540200558346.png)
+![1540200558346](/images/openstack/1540200558346.png)
 
 Ordinary update workflow is:
 
@@ -562,11 +562,11 @@ https://specs.openstack.org/openstack/heat-specs/specs/mitaka/lbaasv2-support.ht
 
 ### 8.1 Network Topology
 
-![1540265416278](./1540265416278.png)
+![1540265416278](/images/openstack/1540265416278.png)
 
 ### 8.2 Network connectivity Architecture
 
-![1540265507765](./1540265507765.png)
+![1540265507765](/images/openstack/1540265507765.png)
 
 ### 8.3 iptables NAT
 
