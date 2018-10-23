@@ -925,15 +925,3 @@ HTB的流控就體現在通過令牌變化情況計算類別節點的模式, 如
 
 為理解分類型流控算法的各種參數的含義, 最好去看一下RFC 3290
 
-
-
-
-
-
-
-
-
-[static struct sk_buff *htb_dequeue(struct Qdisc *sch)](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_htb.c#L856)
-
-
-
