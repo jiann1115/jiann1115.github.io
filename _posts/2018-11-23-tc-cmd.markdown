@@ -1,0 +1,124 @@
+---
+1layout: post
+title:  "Linux Traffic Control - cmd"
+date:   2018-12-13 00:51:40 -0700
+categories: networking
+---
+
+
+
+# Linux Traffic Control - cmd
+
+TC 命令
+
+tc 可以使用以下命令對 QDisc、類和過濾器進行操作:
+
+- add
+
+  在一個節點里加入一個 QDisc、類或者過濾器。添加時，需要傳遞一個 parent 作爲參數，傳遞參數時既可以使用 ID 也可以直接傳遞設備的 root。如果要建立一個 QDisc 或者過濾器，可以使用句柄 (handle) 來命名；如果要建立一個類，可以使用類識別符 (classid) 來命名。
+  Add a qdisc, class or filter to a node. For all entities, a parent must be passed, either by passing its ID or by attaching directly to the root of a device. When creating a qdisc or a filter, it can be named with the handle parameter. A class is named with the classid parameter.
+
+- remove
+
+  刪除有某個句柄 (handle) 指定的 QDisc，根 QDisc (root)也可以刪除。被刪除 QDisc 上的所有子類以及附屬於各個類的過濾器都會被自動刪除。
+  A qdisc can be removed by specifying its handle, which may also be ’root’. All subclasses and their leaf qdiscs are automatically deleted, as well as any filters attached to them.
+
+- change
+
+  以替代的方式修改某些條目。除了句柄 (handle) 和 parent 不能修改以外，change命令的語法和add命令相同。換句話說，change 命令不能移動節點的位置。
+  Some entities can be modified ’in place’. Shares the syntax of ’add’, with the exception that the handle cannot be changed and neither can the parent. In other words, change cannot move a node.
+
+- replace
+
+  對一個現有節點進行近於原子操作的刪除／添加。如果節點不存在，這個命令就會建立節點。
+  Performs a nearly atomic remove/add on an existing node id. If the node doe.
+
+- link
+
+  只適用於 DQisc，替代一個現有的節點。
+  Only available for qdiscs and performs a replace where the node must exist already.
+
+命令個式:
+
+```
+tc qdisc [ add | del | replace | change | show ] dev STRING
+       [ handle QHANDLE ] [ root | ingress | parent CLASSID ]
+       [ estimator INTERVAL TIME_CONSTANT ]
+       [ stab [ help | STAB_OPTIONS] ]
+       [ [ QDISC_KIND ] [ help | OPTIONS ] ]
+
+tc class [ add | del | change | replace | show ] dev STRING
+       [ classid CLASSID ] [ root | parent CLASSID ]
+       [ [ QDISC_KIND ] [ help | OPTIONS ] ]
+
+tc filter [ add | del | change | replace | show ] dev STRING
+       [ pref PRIO ] protocol PROTO
+       [ estimator INTERVAL TIME_CONSTANT ]
+       [ root | classid CLASSID ] [ handle FILTERID ]
+       [ [ FILTER_TYPE ] [ help | OPTIONS ] ]
+
+
+=== option ===
+-s, -stats, -statistics: output more statistics about packet usage.
+-d, -details: output more detailed information about rates and cell sizes.
+-r, -raw: output raw hex values for handles.
+-p, -pretty: decode filter offset and mask values to equivalent filter commands based on TCP/IP.
+-iec: print rates in IEC units (ie. 1K = 1024).
+
+```
+
+監控顯示:
+
+```
+tc [-s | -d ] qdisc show [ dev STRING ] [ingress]
+tc [-s | -d ] class show [ dev STRING ] [ root | parent CLASSID ]
+tc filter show [ dev STRING ] [ root | parent CLASSID ]
+```
+
+
+
+
+
+**EXAMPLE:**
+
+以限制流量而言做範例，針對DEV tap823dcd7d-bc後的vm做http 80 port的流量限制為1Mbit，其餘留量可保持在4Mbit，用以下命令
+
+```
+tc qdisc add dev tap823dcd7d-bc root handle 1: htb default 10
+# 設定1:10流量4Mbit, 以下再分1:100, 1:200 
+tc class add dev tap823dcd7d-bc parent 1: classid 1:10 htb rate 4Mbit ceil 4Mbit
+
+# 讓sport 80導入到1:100, 流量1Mbit, 
+tc class add dev tap823dcd7d-bc parent 1:10 classid 1:100 htb rate 1Mbit ceil 1Mbit prio 1
+tc qdisc add dev tap823dcd7d-bc parent 1:100 handle 101: pfifo
+tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match ip sport 80 0xffff flowid 1:100
+
+# 其他導入到1:200, 流量3Mbit, 
+tc class add dev tap823dcd7d-bc parent 1:10 classid 1:200 htb rate 3Mbit ceil 4Mbit prio 1
+tc qdisc add dev tap823dcd7d-bc parent 1:200 handle 102: pfifo
+tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match u8 0 0 flowid 1:200
+```
+
+刪除命令依序如下
+
+```
+tc filter del dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match ip sport 80 0xffff flowid 1:100
+tc qdisc del dev tap823dcd7d-bc parent 1:200 handle 102:
+tc class del dev tap823dcd7d-bc parent 1:10 classid 1:200
+
+tc filter del dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match u8 0 0 flowid 1:200
+tc qdisc del dev tap823dcd7d-bc parent 1:100 handle 101:
+tc class del dev tap823dcd7d-bc parent 1:10 classid 1:100
+
+tc class del dev tap823dcd7d-bc parent 1:0 classid 1:10
+
+tc qdisc del dev tap823dcd7d-bc root handle 1:
+
+```
+
+
+
+
+
+
+
