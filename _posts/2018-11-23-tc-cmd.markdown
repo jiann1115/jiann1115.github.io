@@ -118,6 +118,42 @@ tc qdisc del dev tap823dcd7d-bc root handle 1:
 
 
 
+對於 filter更詳細的處理，可以看help文件
+
+http://man7.org/linux/man-pages/man8/tc-u32.8.html
+
+我們從中找一些簡單的例子來看
+
+```
+tc filter ... [ handle HANDLE ] u32 OPTION_LIST [ offset OFFSET ] [
+               hashkey HASHKEY ] [ classid CLASSID ] [ divisor uint_value ]
+               [ order u32_value ] [ ht HANDLE ] [ sample SELECTOR [ divisor
+               uint_value ] ] [ link HANDLE ] [ indev ifname ] [ skip_hw |
+               skip_sw ] [ help ]
+
+       OPTION_LIST := [ OPTION_LIST ] OPTION
+
+       OPTION := { match SELECTOR | action ACTION }
+
+       SELECTOR := { u32 VAL_MASK_32 | u16 VAL_MASK_16 | u8 VAL_MASK_8 | ip
+               IP | ip6 IP6 | { tcp | udp } TCPUDP | icmp ICMP | mark
+               VAL_MASK_32 | ether ETHER }
+
+       IP := { { src | dst } { default | any | all | ip_address [ / {
+               prefixlen | netmask } ] } AT | { dsfield | ihl | protocol |
+               precedence | icmp_type | icmp_code } VAL_MASK_8 | { sport |
+               dport } VAL_MASK_16 | nofrag | firstfrag | df | mf }
+```
+
+指令不僅只可針對 IP, TCP, UDP, ICMP或ETH做分類，也能更進一部對這些header內的filed做分類。
+
+下面這個例子就是對ds filed([Differentiated services](https://en.wikipedia.org/wiki/Differentiated_services))的處理範例
+
+```
+tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match ip dsfield 0xe 0x1e flowid 1:100
+
+```
+
 
 
 
