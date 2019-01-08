@@ -150,7 +150,7 @@ tc filter ... [ handle HANDLE ] u32 OPTION_LIST [ offset OFFSET ] [
 下面這個例子就是對ds filed([Differentiated services](https://en.wikipedia.org/wiki/Differentiated_services))的處理範例
 
 ```
-tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match ip dsfield 0xe 0x1e flowid 1:100
+tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match ip dsfield 0xe 0xff flowid 1:100
 
 ```
 
