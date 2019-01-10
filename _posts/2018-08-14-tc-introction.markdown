@@ -13,8 +13,6 @@ categories: networking
 
 ![Netfilter-packet-flow](https://upload.wikimedia.org/wikipedia/commons/3/37/Netfilter-packet-flow.svg)
 
-![ingress_Netfilter-packet-flow.png](/images/tc/ingress_Netfilter-packet-flow.png)![egress_Netfilter-packet-flow.png](/images/tc/egress_Netfilter-packet-flow.png)
-
 一般說到qdisc都是指egress qdisc。每塊網卡實際上還可以添加一個ingress qdisc，不過它有諸多的限制
 
 - ingress qdisc不能包含子類，而只能作過濾
