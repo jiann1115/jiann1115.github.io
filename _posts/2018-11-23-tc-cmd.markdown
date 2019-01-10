@@ -9,7 +9,7 @@ categories: networking
 
 # Linux Traffic Control - cmd
 
-TC 命令
+TC 命令 - user-space utility program 用來設定 [Linux kernel packet scheduler](https://en.wikipedia.org/wiki/Linux_kernel_packet_scheduler)
 
 tc 可以使用以下命令對 QDisc、類和過濾器進行操作:
 
@@ -155,6 +155,55 @@ tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match ip dsfie
 ```
 
 
+
+**TC 命令到Kernel**
+
+![tc_cmd_to kernel](/images/tc/tc_cmd_to kernel.png)
+
+TC 命令透過[libnetlink](http://man7.org/linux/man-pages/man3/libnetlink.3.html)的**rtnl_talk**函數與kernel溝通。
+
+```
+ int rtnl_talk(struct rtnl_handle *rtnl, struct nlmsghdr *n, pid_t peer,
+		     unsigned groups, struct nlmsghdr *answer,
+		     rtnl_filter_t junk,
+		     void *jarg);
+```
+
+在**rtnl_talk**()函數中，會調用**SENDMSG**函數，將信息傳遞到Kernel，rtnl_talk同時也會監聽內核返回的消息，並做相應的處理
+
+```
+if (rtnl_talk(&rth, &req.n, 0, 0, NULL, NULL, NULL) < 0)
+		return 2;
+```
+
+在內核中，最終會調用**tc_modify_qidsc**()函數來創建隊列規定
+
+在[pktsched_init()](https://elixir.bootlin.com/linux/v3.3/source/net/sched/sch_api.c#L1783)函數中（linux kernel）用rtnl_register設定信息:
+
+```
+rtnl_register(PF_UNSPEC, RTM_NEWQDISC, tc_modify_qdisc, NULL);
+    req.n.nlmsg_type = cmd; //對應[cmd1]，類型= RTM_NEWQDISC
+    req.t.tcm_family = AF_UNSPEC;
+```
+
+來為每個信息對應function:
+
+```
+RTM_NEWQDISC -> tc_modify_qdisc
+RTM_DELQDISC -> tc_get_qdisc
+RTM_GETQDISC-> tc_get_qdisc
+RTM_NEWTCLASS -> tc_ctl_tclass
+RTM_DELTCLASS -> tc_ctl_tclass
+RTM_GETTCLASS -> tc_ctl_tclass
+```
+
+filter的對應則在[tc_filter_init()](https://elixir.bootlin.com/linux/v3.3/source/net/sched/cls_api.c#L611)
+
+```
+RTM_NEWTFILTER -> tc_ctl_tfilter
+RTM_DELTFILTER ->   tc_ctl_tfilter
+RTM_GETTFILTER ->  tc_ctl_tfilter
+```
 
 
 
