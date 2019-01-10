@@ -21,16 +21,19 @@ categories: networking
 
 再下達命令前，dev tap823dcd7d-bc是採用pfifo
 
-<table><tr><td bgcolor=black><font color="silver">#tc qdisc show dev tap823dcd7d-bc
-    qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1</font></td></tr></table>
+```
+#tc qdisc show dev tap823dcd7d-bc
+    qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+```
+
 
  我們即將下達的命令是會改變egress的qdisc，會再netfilter下面的位置
 
-![egress_Netfilter-packet-flow](/tc/images/egress_Netfilter-packet-flow.png)
+![egress_Netfilter-packet-flow](/images/tc/egress_Netfilter-packet-flow.png)
 
 Kernel的流程如下圖，Data Link layer 會做packet scheduling，dev_queue_xmit()會對dev的qdisc做 enqueue()，pfifo的enqueue()指向pfifo_fast_enqueue()，然後dequeue()依照pfifo的policy進行
 
-![pfifo](/tc/images/pfifo.png)
+![pfifo](/images/tc/pfifo.png)
 
 現在，我們下達TC命令:
 
@@ -58,27 +61,32 @@ tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 1 u32 match u8 0 0 f
 
 我們從命令查詢，目前dev tap823dcd7d-bc的狀態如下
 
-<table><tr><td bgcolor=black><font color="silver">#tc -d qdisc show dev tap823dcd7d-bc
+```
+#tc -d qdisc show dev tap823dcd7d-bc
 qdisc htb 1: root refcnt 2 r2q 10 default 10 direct_packets_stat 33 ver 3.17 direct_qlen 1000
 qdisc pfifo 101: parent 1:100 limit 1000p
 qdisc pfifo 102: parent 1:200 limit 1000p
-</font></td></tr></table>
+```
 
-<table><tr><td bgcolor=black><font color="silver">#tc -s class show dev tap823dcd7d-bc
+```
+#tc -s class show dev tap823dcd7d-bc
 class htb 1:100 parent 1:10 leaf 101: prio 1 rate 1Mbit ceil 1Mbit burst 1600b cburst 1600b
     ...
 class htb 1:10 root rate 4Mbit ceil 4Mbit burst 1600b cburst 1600b
     ...
-class htb 1:200 parent 1:10 leaf 102: prio 1 rate 3Mbit ceil 4Mbit burst 1599b cburst 1600b</font></td></tr></table>
+class htb 1:200 parent 1:10 leaf 102: prio 1 rate 3Mbit ceil 4Mbit burst 1599b cburst 1600b
+```
 
-<table><tr><td bgcolor=black><font color="silver">#tc filter show dev tap823dcd7d-bc
+```
+#tc filter show dev tap823dcd7d-bc
 filter parent 1: protocol ip pref 1 u32 
 filter parent 1: protocol ip pref 1 u32 fh 800: ht divisor 1 
 filter parent 1: protocol ip pref 1 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:100 
   match 00500000/ffff0000 at 20
 filter parent 1: protocol ip pref 1 u32 fh 800::801 order 2049 key ht 800 bkt 0 flowid 1:200 
   match 00000000/00000000 at 0
-</font></td></tr></table>
+```
+
 
 圖形化來看如下:
 
