@@ -92,3 +92,57 @@ filter parent 1: protocol ip pref 1 u32 fh 800::801 order 2049 key ht 800 bkt 0 
 
 ![htb](/images/tc/htb.png)
 
+
+
+
+
+我們再加上prio的分類，然後把VoIP做QoS，我們可以把設計改成下面方式
+
+> SIP Traffic
+>
+> SIP (signalling) – Class 3, AF31, DSCP: 0x1A, TOS: 0x68
+> RTP (media) – Expedited Forwarding, EF, DSCP: 0x2E, TOS: 0xB8
+
+
+
+```
+tc qdisc add dev tap823dcd7d-bc root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+
+tc qdisc add dev tap823dcd7d-bc parent 1:1 handle 11: pfifo
+tc qdisc add dev tap823dcd7d-bc parent 1:2 handle 12: htb default 10
+
+# SIP TOS: 0x68 導入到1:1
+tc filter add dev tap823dcd7d-bc parent 1: prio 1 protocol ip u32 \
+    match ip tos 0x68 0xff \
+    match ip protocol 0x11 0xff \
+    flowid 1:1
+
+# RTP TOS: 0xB8 導入到1:1
+tc filter add dev tap823dcd7d-bc parent 1: prio 1 protocol ip u32 \
+    match ip tos 0xb8 0xff \
+    match ip protocol 0x11 0xff \
+    flowid 1:1
+
+# 其他導入到1:2
+tc filter add dev tap823dcd7d-bc parent 1: protocol ip prio 2 u32 \
+    match u8 0 0 \
+    flowid 1:2
+
+## 設定12:10流量4Mbit, 以下再分12:100, 12:200
+tc class add dev tap823dcd7d-bc parent 12: classid 12:10 htb rate 4Mbit ceil 4Mbit
+
+## 讓sport 80導入到1:100, 流量1Mbit
+tc class add dev tap823dcd7d-bc parent 12:10 classid 12:100 htb rate 1Mbit ceil 1Mbit prio 2
+tc qdisc add dev tap823dcd7d-bc parent 12:100 handle 101: pfifo
+tc filter add dev tap823dcd7d-bc parent 12: protocol ip prio 2 u32 match ip sport 80 0xffff flowid 12:100
+
+## 其他導入到1:200, 流量3Mbit
+tc class add dev tap823dcd7d-bc parent 12:10 classid 12:200 htb rate 3Mbit ceil 4Mbit prio 2
+tc qdisc add dev tap823dcd7d-bc parent 12:200 handle 102: pfifo
+tc filter add dev tap823dcd7d-bc parent 12: protocol ip prio 2 u32 match u8 0 0 flowid 12:200
+```
+
+圖形化來看，就會變成這樣子
+
+![htb](/images/tc/prio_voip.png)
+
