@@ -96,11 +96,12 @@ filter parent 1: protocol ip pref 1 u32 fh 800::801 order 2049 key ht 800 bkt 0 
 
 
 
-我們再加上prio的分類，然後把VoIP做QoS，我們可以把設計改成下面方式
+我們再加上prio的分類，然後把VoIP做QoS，qdisc prio特性很簡單，會讓priority高的qdisc先送出，確定queue內沒有之後才會送其他次高priority 的qdisc。利用這個特性，讓VoIP的封包能優先被送出，我們可以把設計改成下面方式，把DSCP中VoIP的traffic設定為高優先級
 
 > SIP Traffic
 >
 > SIP (signalling) – Class 3, AF31, DSCP: 0x1A, TOS: 0x68
+>
 > RTP (media) – Expedited Forwarding, EF, DSCP: 0x2E, TOS: 0xB8
 
 
@@ -140,6 +141,43 @@ tc filter add dev tap823dcd7d-bc parent 12: protocol ip prio 2 u32 match ip spor
 tc class add dev tap823dcd7d-bc parent 12:10 classid 12:200 htb rate 3Mbit ceil 4Mbit prio 2
 tc qdisc add dev tap823dcd7d-bc parent 12:200 handle 102: pfifo
 tc filter add dev tap823dcd7d-bc parent 12: protocol ip prio 2 u32 match u8 0 0 flowid 12:200
+```
+
+命令查詢，更新dev tap823dcd7d-bc的狀態如下
+
+```
+#tc -d qdisc show dev tap823dcd7d-bc
+qdisc prio 1: root refcnt 2 bands 2 priomap  1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+qdisc pfifo 11: parent 1:1 limit 1000p
+qdisc htb 12: parent 1:2 r2q 10 default 10 direct_packets_stat 21736 ver 3.17 direct_qlen 1000
+qdisc pfifo 101: parent 12:100 limit 1000p
+qdisc pfifo 102: parent 12:200 limit 1000p
+```
+
+```
+#tc class show dev tap823dcd7d-bc
+class prio 1:1 parent 1: leaf 11: 
+class prio 1:2 parent 1: leaf 12: 
+class htb 12:100 parent 12:10 leaf 101: prio 2 rate 1Mbit ceil 1Mbit burst 1600b cburst 1600b 
+class htb 12:10 root rate 4Mbit ceil 4Mbit burst 1600b cburst 1600b 
+class htb 12:200 parent 12:10 leaf 102: prio 2 rate 3Mbit ceil 4Mbit burst 1599b cburst 1600b
+```
+
+```
+#tc filter show dev tap823dcd7d-bc
+filter parent 1: protocol ip pref 1 u32 
+filter parent 1: protocol ip pref 1 u32 fh 800: ht divisor 1 
+filter parent 1: protocol ip pref 1 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1 
+  match 00680000/00ff0000 at 0
+  match 00110000/00ff0000 at 8
+filter parent 1: protocol ip pref 1 u32 fh 800::801 order 2049 key ht 800 bkt 0 flowid 1:1 
+  match 00b80000/00ff0000 at 0
+  match 00110000/00ff0000 at 8
+filter parent 1: protocol ip pref 3 u32 
+filter parent 1: protocol ip pref 3 u32 fh 801: ht divisor 1 
+filter parent 1: protocol ip pref 3 u32 fh 801::800 order 2048 key ht 801 bkt 0 flowid 1:2 
+  match 00000000/00000000 at 0
+
 ```
 
 圖形化來看，就會變成這樣子
